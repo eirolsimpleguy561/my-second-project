@@ -1,0 +1,418 @@
+import asyncio
+import json
+import random
+import uuid
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from dataclasses import dataclass, field
+import strawberry
+from strawberry.types import Info
+from strawberry.fastapi import GraphQLRouter
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# Data models
+@strawberry.type
+class Author:
+    id: str
+    name: str
+    email: str
+    bio: Optional[str] = None
+    created_at: str
+
+@strawberry.type
+class Post:
+    id: str
+    title: str
+    content: str
+    author_id: str
+    created_at: str
+    updated_at: Optional[str] = None
+    published: bool = True
+
+@strawberry.type
+class Comment:
+    id: str
+    content: str
+    post_id: str
+    author_id: str
+    created_at: str
+
+# Input types
+@strawberry.input
+class CreateAuthorInput:
+    name: str
+    email: str
+    bio: Optional[str] = None
+
+@strawberry.input
+class UpdatePostInput:
+    title: Optional[str] = None
+    content: Optional[str] = None
+    published: Optional[bool] = None
+
+@strawberry.input
+class PostFilter:
+    published: Optional[bool] = None
+    author_id: Optional[str] = None
+    search: Optional[str] = None
+
+# Pagination
+@strawberry.type
+class PageInfo:
+    has_next_page: bool
+    has_previous_page: bool
+    start_cursor: Optional[str] = None
+    end_cursor: Optional[str] = None
+
+@strawberry.type
+class PostConnection:
+    edges: List[Post]
+    page_info: PageInfo
+    total_count: int
+
+# In-memory database
+class Database:
+    def __init__(self):
+        self.authors: Dict[str, Author] = {}
+        self.posts: Dict[str, Post] = {}
+        self.comments: Dict[str, Comment] = {}
+        
+        # Seed some data
+        self._seed_data()
+    
+    def _seed_data(self):
+        # Create authors
+        authors = [
+            Author(id=str(uuid.uuid4()), name="Alice Johnson", email="alice@example.com", 
+                   bio="Tech writer and developer", created_at=datetime.now().isoformat()),
+            Author(id=str(uuid.uuid4()), name="Bob Smith", email="bob@example.com", 
+                   bio="Full-stack developer", created_at=datetime.now().isoformat()),
+            Author(id=str(uuid.uuid4()), name="Carol Davis", email="carol@example.com", 
+                   bio="Data scientist", created_at=datetime.now().isoformat()),
+        ]
+        
+        for author in authors:
+            self.authors[author.id] = author
+        
+        # Create posts
+        posts = [
+            Post(id=str(uuid.uuid4()), title="Getting Started with GraphQL", 
+                 content="GraphQL is a query language for APIs...", 
+                 author_id=authors[0].id, created_at=datetime.now().isoformat(), published=True),
+            Post(id=str(uuid.uuid4()), title="Python Async Programming", 
+                 content="Async programming in Python...", 
+                 author_id=authors[1].id, created_at=datetime.now().isoformat(), published=True),
+            Post(id=str(uuid.uuid4()), title="Data Science 101", 
+                 content="Introduction to data science...", 
+                 author_id=authors[2].id, created_at=datetime.now().isoformat(), published=False),
+        ]
+        
+        for post in posts:
+            self.posts[post.id] = post
+    
+    def get_author(self, author_id: str) -> Optional[Author]:
+        return self.authors.get(author_id)
+    
+    def get_authors(self) -> List[Author]:
+        return list(self.authors.values())
+    
+    def create_author(self, name: str, email: str, bio: Optional[str] = None) -> Author:
+        author = Author(
+            id=str(uuid.uuid4()),
+            name=name,
+            email=email,
+            bio=bio,
+            created_at=datetime.now().isoformat()
+        )
+        self.authors[author.id] = author
+        return author
+    
+    def get_post(self, post_id: str) -> Optional[Post]:
+        return self.posts.get(post_id)
+    
+    def get_posts(self, filter: Optional[PostFilter] = None) -> List[Post]:
+        posts = list(self.posts.values())
+        
+        if filter:
+            if filter.published is not None:
+                posts = [p for p in posts if p.published == filter.published]
+            if filter.author_id:
+                posts = [p for p in posts if p.author_id == filter.author_id]
+            if filter.search:
+                search_lower = filter.search.lower()
+                posts = [p for p in posts if 
+                        search_lower in p.title.lower() or 
+                        search_lower in p.content.lower()]
+        
+        return posts
+    
+    def create_post(self, title: str, content: str, author_id: str) -> Post:
+        post = Post(
+            id=str(uuid.uuid4()),
+            title=title,
+            content=content,
+            author_id=author_id,
+            created_at=datetime.now().isoformat(),
+            published=True
+        )
+        self.posts[post.id] = post
+        return post
+    
+    def update_post(self, post_id: str, updates: UpdatePostInput) -> Optional[Post]:
+        post = self.posts.get(post_id)
+        if not post:
+            return None
+        
+        if updates.title is not None:
+            post.title = updates.title
+        if updates.content is not None:
+            post.content = updates.content
+        if updates.published is not None:
+            post.published = updates.published
+        
+        post.updated_at = datetime.now().isoformat()
+        return post
+    
+    def delete_post(self, post_id: str) -> bool:
+        if post_id in self.posts:
+            del self.posts[post_id]
+            return True
+        return False
+    
+    def get_comments(self, post_id: str) -> List[Comment]:
+        return [c for c in self.comments.values() if c.post_id == post_id]
+    
+    def add_comment(self, post_id: str, author_id: str, content: str) -> Comment:
+        comment = Comment(
+            id=str(uuid.uuid4()),
+            content=content,
+            post_id=post_id,
+            author_id=author_id,
+            created_at=datetime.now().isoformat()
+        )
+        self.comments[comment.id] = comment
+        return comment
+
+# GraphQL Schema
+@strawberry.type
+class Query:
+    @strawberry.field
+    def authors(self) -> List[Author]:
+        return db.get_authors()
+    
+    @strawberry.field
+    def author(self, id: str) -> Optional[Author]:
+        return db.get_author(id)
+    
+    @strawberry.field
+    def posts(self, filter: Optional[PostFilter] = None) -> List[Post]:
+        return db.get_posts(filter)
+    
+    @strawberry.field
+    def post(self, id: str) -> Optional[Post]:
+        return db.get_post(id)
+    
+    @strawberry.field
+    def post_comments(self, post_id: str) -> List[Comment]:
+        return db.get_comments(post_id)
+    
+    @strawberry.field
+    def posts_paginated(self, first: int = 10, after: Optional[str] = None) -> PostConnection:
+        posts = db.get_posts()
+        
+        # Simple pagination
+        start = 0
+        if after:
+            try:
+                start = int(after) + 1
+            except:
+                pass
+        
+        end = min(start + first, len(posts))
+        paginated = posts[start:end]
+        
+        return PostConnection(
+            edges=paginated,
+            page_info=PageInfo(
+                has_next_page=end < len(posts),
+                has_previous_page=start > 0,
+                start_cursor=str(start) if paginated else None,
+                end_cursor=str(end - 1) if paginated else None
+            ),
+            total_count=len(posts)
+        )
+
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    def create_author(self, input: CreateAuthorInput) -> Author:
+        return db.create_author(input.name, input.email, input.bio)
+    
+    @strawberry.mutation
+    def create_post(self, title: str, content: str, author_id: str) -> Post:
+        return db.create_post(title, content, author_id)
+    
+    @strawberry.mutation
+    def update_post(self, id: str, input: UpdatePostInput) -> Optional[Post]:
+        return db.update_post(id, input)
+    
+    @strawberry.mutation
+    def delete_post(self, id: str) -> bool:
+        return db.delete_post(id)
+    
+    @strawberry.mutation
+    def add_comment(self, post_id: str, author_id: str, content: str) -> Comment:
+        return db.add_comment(post_id, author_id, content)
+
+# Subscription
+@strawberry.type
+class Subscription:
+    @strawberry.subscription
+    async def post_created(self) -> AsyncGenerator[Post, None]:
+        """Subscribe to new post creation events"""
+        # Using a queue for simplicity
+        queue = asyncio.Queue()
+        subscriptions.append(queue)
+        
+        try:
+            while True:
+                post = await queue.get()
+                yield post
+        except asyncio.CancelledError:
+            subscriptions.remove(queue)
+            raise
+
+# Notification system
+subscriptions: List[asyncio.Queue] = []
+
+def notify_post_created(post: Post):
+    """Notify all subscribers about a new post"""
+    for queue in subscriptions:
+        queue.put_nowait(post)
+
+# Initialize database
+db = Database()
+
+# Create schema
+schema = strawberry.Schema(query=Query, mutation=Mutation, subscription=Subscription)
+
+# Create FastAPI app
+app = FastAPI(title="GraphQL Blog API")
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# GraphQL endpoint
+graphql_app = GraphQLRouter(schema)
+app.include_router(graphql_app, prefix="/graphql")
+
+# Override mutation to send notifications
+@strawberry.mutation
+class CustomMutation(Mutation):
+    @strawberry.mutation
+    def create_post(self, title: str, content: str, author_id: str) -> Post:
+        post = db.create_post(title, content, author_id)
+        # Notify subscribers
+        notify_post_created(post)
+        return post
+
+# Update schema with custom mutation
+schema = strawberry.Schema(query=Query, mutation=CustomMutation, subscription=Subscription)
+graphql_app = GraphQLRouter(schema)
+app.include_router(graphql_app, prefix="/graphql")
+
+@app.get("/")
+async def root():
+    return {
+        "message": "GraphQL Blog API",
+        "graphql": "/graphql",
+        "playground": "/graphql",
+        "docs": "Use GraphQL playground for API exploration"
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "posts": len(db.posts), "authors": len(db.authors)}
+
+# WebSocket for real-time subscriptions
+@app.websocket("/subscriptions")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    queue = asyncio.Queue()
+    subscriptions.append(queue)
+    
+    try:
+        while True:
+            # Wait for messages or timeout
+            try:
+                data = await asyncio.wait_for(queue.get(), timeout=30)
+                await websocket.send_json(json.dumps(data, default=str))
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                await websocket.send_json({"type": "heartbeat", "timestamp": datetime.now().isoformat()})
+    except WebSocketDisconnect:
+        subscriptions.remove(queue)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        if queue in subscriptions:
+            subscriptions.remove(queue)
+
+async def main():
+    print("=== GraphQL API with Apollo ===")
+    print("\nGraphQL API Features:")
+    print("  - Queries: authors, posts, post_comments")
+    print("  - Mutations: create_post, update_post, delete_post")
+    print("  - Subscriptions: post_created (WebSocket)")
+    print("  - Advanced filtering and pagination")
+    print(f"\nDatabase seeded with {len(db.authors)} authors and {len(db.posts)} posts")
+    print("\nAPI endpoints:")
+    print("  - GraphQL Playground: http://localhost:8000/graphql")
+    print("  - WebSocket: ws://localhost:8000/subscriptions")
+    print("  - Health check: http://localhost:8000/health")
+    
+    # Run server
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
+# Install: pip install strawberry-graphql strawberry-graphql[fastapi] uvicorn
+
+# Example GraphQL queries:
+# Query all posts:
+# {
+#   posts {
+#     id
+#     title
+#     content
+#     author { name }
+#   }
+# }
+#
+# Create post mutation:
+# mutation {
+#   createPost(title: "New Post", content: "Content", authorId: "author-id") {
+#     id
+#     title
+#     createdAt
+#   }
+# }
+#
+# Subscription (WebSocket):
+# subscription {
+#   postCreated {
+#     id
+#     title
+#     author { name }
+#   }
+# }

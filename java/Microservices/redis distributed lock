@@ -1,0 +1,167 @@
+import redis.clients.jedis.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.time.*;
+
+class DistributedLock {
+    private final JedisPool jedisPool;
+    private final String lockKey;
+    private final String lockValue;
+    private final long lockTimeout;
+    private final Semaphore waitSemaphore = new Semaphore(1);
+
+    public DistributedLock(String host, int port, String lockKey, long lockTimeoutMs) {
+        this.jedisPool = new JedisPool(host, port);
+        this.lockKey = "lock:" + lockKey;
+        this.lockValue = UUID.randomUUID().toString();
+        this.lockTimeout = lockTimeoutMs;
+    }
+
+    public boolean acquire() throws InterruptedException {
+        return acquire(0, TimeUnit.MILLISECONDS);
+    }
+
+    public boolean acquire(long timeout, TimeUnit unit) throws InterruptedException {
+        long startTime = System.currentTimeMillis();
+        long timeoutMs = unit.toMillis(timeout);
+
+        while (true) {
+            try (Jedis jedis = jedisPool.getResource()) {
+                String response = jedis.set(lockKey, lockValue, "NX", "PX", lockTimeout);
+                
+                if ("OK".equals(response)) {
+                    // Start renewal thread for long operations
+                    startRenewal();
+                    return true;
+                }
+
+                if (timeoutMs == 0) {
+                    return false;
+                }
+
+                long elapsed = System.currentTimeMillis() - startTime;
+                if (elapsed >= timeoutMs) {
+                    return false;
+                }
+
+                // Wait and retry
+                Thread.sleep(Math.min(100, timeoutMs - elapsed));
+            }
+        }
+    }
+
+    public boolean release() {
+        try (Jedis jedis = jedisPool.getResource()) {
+            String luaScript = 
+                "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                "  return redis.call('del', KEYS[1]) " +
+                "else " +
+                "  return 0 " +
+                "end";
+            
+            Long result = (Long) jedis.eval(luaScript, 1, lockKey, lockValue);
+            return result == 1;
+        }
+    }
+
+    public boolean isLocked() {
+        try (Jedis jedis = jedisPool.getResource()) {
+            String value = jedis.get(lockKey);
+            return value != null;
+        }
+    }
+
+    public boolean isHeldByCurrentThread() {
+        try (Jedis jedis = jedisPool.getResource()) {
+            String value = jedis.get(lockKey);
+            return lockValue.equals(value);
+        }
+    }
+
+    private void startRenewal() {
+        Thread renewalThread = new Thread(() -> {
+            try {
+                while (isHeldByCurrentThread()) {
+                    Thread.sleep(lockTimeout / 3);
+                    try (Jedis jedis = jedisPool.getResource()) {
+                        String luaScript = 
+                            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                            "  return redis.call('pexpire', KEYS[1], ARGV[2]) " +
+                            "else " +
+                            "  return 0 " +
+                            "end";
+                        
+                        jedis.eval(luaScript, 1, lockKey, lockValue, String.valueOf(lockTimeout));
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        renewalThread.setDaemon(true);
+        renewalThread.start();
+    }
+
+    public void close() {
+        jedisPool.close();
+    }
+}
+
+class DistributedLockManager {
+    private final Map<String, DistributedLock> locks = new ConcurrentHashMap<>();
+    private final String host;
+    private final int port;
+
+    public DistributedLockManager(String host, int port) {
+        this.host = host;
+        this.port = port;
+    }
+
+    public DistributedLock getLock(String key, long timeoutMs) {
+        return locks.computeIfAbsent(key, k ->
+            new DistributedLock(host, port, k, timeoutMs)
+        );
+    }
+}
+
+// === Usage example ===
+public class Main {
+    private static final DistributedLockManager lockManager = new DistributedLockManager("localhost", 6379);
+    private static int counter = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        
+        for (int i = 0; i < 10; i++) {
+            executor.submit(() -> {
+                DistributedLock lock = lockManager.getLock("counter", 5000);
+                try {
+                    if (lock.acquire(5, TimeUnit.SECONDS)) {
+                        try {
+                            // Critical section
+                            System.out.println("Thread " + Thread.currentThread().getId() + " acquired lock");
+                            for (int j = 0; j < 10; j++) {
+                                int current = counter;
+                                Thread.sleep(10);
+                                counter = current + 1;
+                            }
+                            System.out.println("Counter: " + counter);
+                        } finally {
+                            lock.release();
+                            System.out.println("Thread " + Thread.currentThread().getId() + " released lock");
+                        }
+                    } else {
+                        System.out.println("Thread " + Thread.currentThread().getId() + " could not acquire lock");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+
+        executor.shutdown();
+        executor.awaitTermination(30, TimeUnit.SECONDS);
+        System.out.println("Final counter value: " + counter);
+    }
+}

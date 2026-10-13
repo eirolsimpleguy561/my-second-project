@@ -1,0 +1,236 @@
+// === pom.xml dependencies ===
+// flink-streaming-java, flink-clients, flink-connector-kafka
+
+import org.apache.flink.api.common.eventtime.*;
+import org.apache.flink.api.common.functions.*;
+import org.apache.flink.api.common.state.*;
+import org.apache.flink.api.java.tuple.*;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.cep.*;
+import org.apache.flink.cep.pattern.*;
+import org.apache.flink.cep.pattern.conditions.*;
+import org.apache.flink.streaming.api.*;
+import org.apache.flink.streaming.api.datastream.*;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.*;
+import org.apache.flink.streaming.api.functions.windowing.*;
+import org.apache.flink.streaming.api.windowing.assigners.*;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
+import org.apache.flink.util.Collector;
+import java.time.Duration;
+import java.util.*;
+
+// === Event Classes ===
+class ClickEvent {
+    private String userId;
+    private String page;
+    private long timestamp;
+    private long duration;
+
+    public ClickEvent() {}
+    public ClickEvent(String userId, String page, long timestamp) {
+        this.userId = userId;
+        this.page = page;
+        this.timestamp = timestamp;
+    }
+
+    public String getUserId() { return userId; }
+    public String getPage() { return page; }
+    public long getTimestamp() { return timestamp; }
+    public long getDuration() { return duration; }
+    public void setDuration(long duration) { this.duration = duration; }
+}
+
+class UserStats {
+    private String userId;
+    private long pageCount;
+    private long totalDuration;
+
+    public UserStats(String userId, long pageCount, long totalDuration) {
+        this.userId = userId;
+        this.pageCount = pageCount;
+        this.totalDuration = totalDuration;
+    }
+
+    public String getUserId() { return userId; }
+    public long getPageCount() { return pageCount; }
+    public long getTotalDuration() { return totalDuration; }
+}
+
+// === Main Flink Job ===
+public class FlinkStreamProcessor {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+        env.enableCheckpointing(10000);
+
+        // 1. Source: Kafka (or generate synthetic data)
+        DataStream<ClickEvent> events = env
+            .addSource(new ClickEventSource())
+            .assignTimestampsAndWatermarks(new WatermarkStrategy<ClickEvent>() {
+                @Override
+                public WatermarkGenerator<ClickEvent> createWatermarkGenerator(
+                    WatermarkGeneratorSupplier.Context context) {
+                    return new WatermarkGenerator<ClickEvent>() {
+                        private long maxTimestamp = 0;
+                        private final long maxOutOfOrderness = 5000;
+
+                        @Override
+                        public void onEvent(ClickEvent event, long eventTimestamp, 
+                                          WatermarkOutput output) {
+                            maxTimestamp = Math.max(maxTimestamp, event.getTimestamp());
+                        }
+
+                        @Override
+                        public void onPeriodicEmit(WatermarkOutput output) {
+                            output.emitWatermark(new Watermark(
+                                maxTimestamp - maxOutOfOrderness
+                            ));
+                        }
+                    };
+                }
+            });
+
+        // 2. Count clicks per page per minute (tumbling window)
+        DataStream<Tuple2<String, Long>> pageCounts = events
+            .map(new MapFunction<ClickEvent, Tuple2<String, Long>>() {
+                @Override
+                public Tuple2<String, Long> map(ClickEvent event) {
+                    return Tuple2.of(event.getPage(), 1L);
+                }
+            })
+            .keyBy(tuple -> tuple.f0)
+            .window(TumblingEventTimeWindows.of(Time.minutes(1)))
+            .sum(1);
+
+        pageCounts.print().name("page-counts");
+
+        // 3. User session analysis (session window)
+        DataStream<UserStats> userSessions = events
+            .keyBy(ClickEvent::getUserId)
+            .window(EventTimeSessionWindows.withGap(Time.minutes(30)))
+            .aggregate(new AggregateFunction<ClickEvent, UserStats, UserStats>() {
+                @Override
+                public UserStats createAccumulator() {
+                    return new UserStats("", 0, 0);
+                }
+
+                @Override
+                public UserStats add(ClickEvent event, UserStats acc) {
+                    return new UserStats(
+                        event.getUserId(),
+                        acc.getPageCount() + 1,
+                        acc.getTotalDuration() + event.getDuration()
+                    );
+                }
+
+                @Override
+                public UserStats getResult(UserStats acc) {
+                    return acc;
+                }
+
+                @Override
+                public UserStats merge(UserStats a, UserStats b) {
+                    return new UserStats(
+                        a.getUserId(),
+                        a.getPageCount() + b.getPageCount(),
+                        a.getTotalDuration() + b.getTotalDuration()
+                    );
+                }
+            });
+
+        userSessions.print().name("user-sessions");
+
+        // 4. Stateful processing: Track user's last page
+        DataStream<Tuple2<String, String>> userJourney = events
+            .keyBy(ClickEvent::getUserId)
+            .process(new KeyedProcessFunction<String, ClickEvent, Tuple2<String, String>>() {
+                private ValueState<String> lastPageState;
+
+                @Override
+                public void open(Configuration parameters) {
+                    ValueStateDescriptor<String> descriptor = 
+                        new ValueStateDescriptor<>("lastPage", String.class);
+                    lastPageState = getRuntimeContext().getState(descriptor);
+                }
+
+                @Override
+                public void processElement(ClickEvent event, Context ctx, 
+                                          Collector<Tuple2<String, String>> out) throws Exception {
+                    String lastPage = lastPageState.value();
+                    if (lastPage != null && !lastPage.equals(event.getPage())) {
+                        out.collect(Tuple2.of(
+                            event.getUserId(),
+                            lastPage + " -> " + event.getPage()
+                        ));
+                    }
+                    lastPageState.update(event.getPage());
+                }
+            });
+
+        userJourney.print().name("user-journey");
+
+        // 5. CEP Pattern: Detect unusual behavior
+        Pattern<ClickEvent, ClickEvent> suspiciousPattern = Pattern
+            .<ClickEvent>begin("first")
+            .where(new SimpleCondition<ClickEvent>() {
+                @Override
+                public boolean filter(ClickEvent event) {
+                    return event.getPage().equals("login");
+                }
+            })
+            .next("second")
+            .where(new SimpleCondition<ClickEvent>() {
+                @Override
+                public boolean filter(ClickEvent event) {
+                    return event.getPage().equals("admin");
+                }
+            })
+            .within(Time.seconds(5));
+
+        DataStream<String> alerts = CEP.pattern(events.keyBy(ClickEvent::getUserId), suspiciousPattern)
+            .select(new PatternSelectFunction<ClickEvent, String>() {
+                @Override
+                public String select(Map<String, List<ClickEvent>> pattern) {
+                    ClickEvent first = pattern.get("first").get(0);
+                    ClickEvent second = pattern.get("second").get(0);
+                    return String.format("ALERT: User %s accessed admin within 5s of login", 
+                        first.getUserId());
+                }
+            });
+
+        alerts.print().name("alerts");
+
+        env.execute("Flink Stream Processing Job");
+    }
+}
+
+// === Custom Source for testing ===
+class ClickEventSource extends RichSourceFunction<ClickEvent> {
+    private volatile boolean running = true;
+    private final Random random = new Random();
+    private final String[] pages = {"home", "product", "cart", "checkout", "login", "admin"};
+    private final String[] users = {"user1", "user2", "user3", "user4", "user5"};
+
+    @Override
+    public void run(SourceContext<ClickEvent> ctx) throws Exception {
+        long startTime = System.currentTimeMillis();
+        while (running) {
+            ClickEvent event = new ClickEvent(
+                users[random.nextInt(users.length)],
+                pages[random.nextInt(pages.length)],
+                startTime + random.nextInt(60000)
+            );
+            event.setDuration(random.nextInt(30000));
+            
+            ctx.collect(event);
+            Thread.sleep(random.nextInt(100));
+        }
+    }
+
+    @Override
+    public void cancel() {
+        running = false;
+    }
+}
